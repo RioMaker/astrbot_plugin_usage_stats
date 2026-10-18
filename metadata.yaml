@@ -1,0 +1,7 @@
+name: astrbot_plugin_usage_stats
+display_name: 使用统计
+desc: 轻量记录每人指令次数、LLM用量与活跃时段，提供个人明细和群指令排行榜。
+version: "0.1.0"
+author: Rio
+repo: ""
+astrbot_version: ">=4.29.1,<5"

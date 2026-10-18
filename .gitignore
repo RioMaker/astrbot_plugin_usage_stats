@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+.dev/
+local_test/output/
+dist/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
