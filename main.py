@@ -16,9 +16,12 @@ from .renderer import render_leaderboard
 from .reporting import (
     clean,
     command_details,
+    format_started_at,
     leaderboard_text,
     model_details,
     personal_summary,
+    token_leaderboard_text,
+    token_summary,
 )
 from .storage import Identity, Store
 from .usage import field, normalize_usage, provider_labels
@@ -96,16 +99,18 @@ class UsageStats(Star):
             return
         input_, output, total = normalize_usage(response)
         provider_id, model = provider_labels(provider, response)
+        completed_at = datetime.now(BEIJING)
         await asyncio.to_thread(
             self.store.record_llm,
             identity,
             provider_id,
             model,
-            datetime.now(BEIJING).hour,
+            completed_at.hour,
             input_,
             output,
             total,
             failed=failed or field(response, "role") == "err",
+            occurred_at=completed_at,
         )
 
     async def _warning(self):
@@ -202,6 +207,67 @@ class UsageStats(Star):
             logger.warning(f"[使用统计] 排行图片不可用：{type(exc).__name__}")
             if "data" in locals():
                 yield event.plain_result(leaderboard_text(data))
+            else:
+                yield event.plain_result("统计读取失败，请管理员检查数据库状态。")
+
+    @filter.command("token")
+    async def token_stats(self, event: AstrMessageEvent):
+        """查询个人累计及今日已知 Token 用量和统计开始时间。"""
+        event.stop_event()
+        identity = self._identity(event)
+        if not identity or not self.store:
+            yield event.plain_result("统计尚未就绪，或此消息没有可识别的发送者。")
+            return
+        try:
+            data = await asyncio.to_thread(self.store.token_summary, identity)
+            text = token_summary(identity.name, data)
+            warning = await self._warning()
+            yield event.plain_result(text + ("\n" + warning if warning else ""))
+        except Exception as exc:
+            logger.warning(f"[使用统计] Token 查询失败：{type(exc).__name__}")
+            yield event.plain_result(
+                "统计读取失败，请管理员检查数据库状态；已有数据不会被自动清空。"
+            )
+
+    @filter.command("token排行")
+    async def token_ranking(self, event: AstrMessageEvent):
+        """显示当前群累计已知 Token 排行榜。"""
+        event.stop_event()
+        identity = self._identity(event)
+        if not identity or not identity.group:
+            yield event.plain_result("请在群聊中使用 /token排行。")
+            return
+        if not self.store:
+            yield event.plain_result("统计尚未就绪。")
+            return
+        try:
+            data = await asyncio.to_thread(
+                self.store.token_leaderboard,
+                identity,
+                limit=self._int("leaderboard_size", 10, 1, 20),
+            )
+            warning = await self._warning()
+            if warning:
+                yield event.plain_result(token_leaderboard_text(data) + "\n" + warning)
+                return
+            async with self._render_lock:
+                png = await asyncio.to_thread(
+                    render_leaderboard,
+                    data["entries"],
+                    group_label=f"群 {identity.group}",
+                    personal=data["self"],
+                    font_path=self.config.get("font_path") or None,
+                    title="群 Token 排行",
+                    subtitle="本群累计 · 按已知 Token 排名",
+                    metric="tokens",
+                    started_at=format_started_at(data["started_at"]),
+                    missing_usage=data["missing_usage"],
+                )
+            yield event.chain_result([Image.fromBytes(png)])
+        except Exception as exc:
+            logger.warning(f"[使用统计] Token 排行图片不可用：{type(exc).__name__}")
+            if "data" in locals():
+                yield event.plain_result(token_leaderboard_text(data))
             else:
                 yield event.plain_result("统计读取失败，请管理员检查数据库状态。")
 

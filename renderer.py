@@ -138,6 +138,7 @@ def _draw_row(
     fonts: _Fonts,
     row: Mapping[str, Any],
     index: int,
+    unit: str = "次指令调用",
 ) -> None:
     top = HEADER_HEIGHT + index * ROW_HEIGHT + 8
     rank = _counter(row.get("rank", index + 1))
@@ -201,7 +202,7 @@ def _draw_row(
     )
     draw.text(
         (WIDTH - 62, top + 72),
-        "次指令调用",
+        unit,
         font=fonts(15),
         anchor="rm",
         fill="#8B99AB",
@@ -216,18 +217,30 @@ def render_leaderboard(
     title: str = "群使用排行",
     subtitle: str = "本群累计 · 按指令调用次数排行",
     font_path: str | Path | None = None,
+    metric: str = "commands",
+    started_at: str | None = None,
+    missing_usage: int = 0,
 ) -> bytes:
     """Return a PNG for zero to twenty already-sorted leaderboard rows.
 
     Each row accepts ``user``, ``name``, ``count``, and optional ``rank``.
     ``personal`` accepts ``rank`` and ``count`` for the requesting member's
-    group totals. This function never changes ranking order or writes files.
+    group totals. Token mode uses known input + output totals and displays the
+    supplied Beijing start time without truncation. This function never changes
+    ranking order or writes files.
     """
     if len(rows) > MAX_ROWS:
         raise ValueError(f"排行榜最多绘制 {MAX_ROWS} 人")
+    if metric not in ("commands", "tokens"):
+        raise ValueError("排行指标必须为 commands 或 tokens")
+    is_tokens = metric == "tokens"
+    if is_tokens:
+        missing_usage = _counter(missing_usage)
     fonts = _Fonts(resolve_font_path(font_path))
     content_height = len(rows) * ROW_HEIGHT if rows else 180
     footer_height = 114 if personal is not None else 60
+    if is_tokens:
+        footer_height += 34
     height = HEADER_HEIGHT + content_height + footer_height
     canvas = Image.new("RGB", (WIDTH, height), "#F2F5FA")
     draw = ImageDraw.Draw(canvas)
@@ -251,7 +264,9 @@ def render_leaderboard(
     )
     if rows:
         for index, row in enumerate(rows):
-            _draw_row(canvas, draw, fonts, row, index)
+            _draw_row(
+                canvas, draw, fonts, row, index, "Token" if is_tokens else "次指令调用"
+            )
     else:
         draw.rounded_rectangle(
             (32, HEADER_HEIGHT + 8, WIDTH - 32, HEADER_HEIGHT + 164),
@@ -261,7 +276,7 @@ def render_leaderboard(
         )
         draw.text(
             (WIDTH // 2, HEADER_HEIGHT + 67),
-            "本群暂无指令使用记录",
+            "本群暂无已知 Token 记录" if is_tokens else "本群暂无指令使用记录",
             font=fonts(29),
             anchor="mm",
             fill="#455F86",
@@ -279,7 +294,10 @@ def render_leaderboard(
         count = _counter(personal.get("count", 0))
         rank = personal.get("rank")
         rank_text = f"第 {_counter(rank):,} 名" if rank else "暂未上榜"
-        text = f"我的本群排名：{rank_text}     累计指令：{count:,} 次"
+        total_text = (
+            f"累计 Token：{count:,}" if is_tokens else f"累计指令：{count:,} 次"
+        )
+        text = f"我的本群排名：{rank_text}     {total_text}"
         draw.rounded_rectangle(
             (32, footer_top + 8, WIDTH - 32, footer_top + 62),
             radius=15,
@@ -291,8 +309,17 @@ def render_leaderboard(
             font=fonts(20),
             fill="#465F83",
         )
-    footer = f"仅排行本群指令调用 · 当前显示 {len(rows)} 人 · 不含 LLM 调用次数"
-    draw.text((44, height - 40), footer, font=fonts(16), fill="#7A899C")
+    if is_tokens:
+        footer = (
+            f"已知 Token 含输入与输出 · 当前显示 {len(rows)} 人"
+            f" · 缺失 {missing_usage:,} 次不估算"
+        )
+        start_text = f"统计开始：{_clean_text(started_at, '暂无记录')}（北京时间）"
+        draw.text((44, height - 74), footer, font=fonts(16), fill="#7A899C")
+        draw.text((44, height - 40), start_text, font=fonts(16), fill="#7A899C")
+    else:
+        footer = f"仅排行本群指令调用 · 当前显示 {len(rows)} 人 · 不含 LLM 调用次数"
+        draw.text((44, height - 40), footer, font=fonts(16), fill="#7A899C")
     output = io.BytesIO()
     canvas.save(output, format="PNG", optimize=True)
     return output.getvalue()

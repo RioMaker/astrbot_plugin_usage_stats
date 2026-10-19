@@ -3,13 +3,13 @@
     "description": "统计数据库容量上限（MiB）",
     "type": "int",
     "default": 64,
-    "hint": "仅保存累计数据。范围 1–1024；达到上限时保留旧数据并报告写入异常。SQLite 事务日志会短暂占用额外空间。"
+    "hint": "仅保存聚合数据和每人最新日期的 Token 汇总。范围 1–1024；达到上限时保留旧数据并报告写入异常。SQLite 事务日志会短暂占用额外空间。"
   },
   "leaderboard_size": {
     "description": "群排行榜展示人数",
     "type": "int",
     "default": 10,
-    "hint": "1–20，仅按当前群累计指令调用次数排名。"
+    "hint": "1–20，/使用排行与/token排行共用；分别按当前群累计指令次数或已知 Token 排名。"
   },
   "font_path": {
     "description": "排行榜中文字体文件（可选）",

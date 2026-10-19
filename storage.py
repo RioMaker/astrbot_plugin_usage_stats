@@ -10,7 +10,7 @@ import struct
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -18,10 +18,26 @@ _HOURS = struct.Struct("<24Q")
 _EMPTY_HOURS = _HOURS.pack(*([0] * 24))
 _MAX_INT = (1 << 63) - 1
 _META_BYTES = 2048
+_BEIJING = timezone(timedelta(hours=8))
+_TOKEN_FIELDS = (
+    "llm_calls",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "missing_usage",
+    "failed_calls",
+)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _beijing_day(value: datetime | None = None) -> str:
+    value = datetime.now(timezone.utc) if value is None else value
+    if not isinstance(value, datetime) or value.utcoffset() is None:
+        raise ValueError("token timestamps must be timezone-aware datetimes")
+    return value.astimezone(_BEIJING).date().isoformat()
 
 
 class StorageError(RuntimeError):
@@ -145,7 +161,7 @@ class Store:
 
     def _initialize(self) -> None:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        if version not in (0, 1, 2):
             raise StorageError(f"unsupported statistics schema version: {version}")
         statements = [
             """CREATE TABLE IF NOT EXISTS users (
@@ -183,6 +199,22 @@ class Store:
             ) WITHOUT ROWID""",
             """CREATE INDEX IF NOT EXISTS group_lookup
                 ON group_counts(group_id, count DESC, user_id)""",
+            """CREATE TABLE IF NOT EXISTS daily_tokens (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id),
+                day TEXT NOT NULL,
+                llm_calls INTEGER NOT NULL, input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL,
+                missing_usage INTEGER NOT NULL, failed_calls INTEGER NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS group_tokens (
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                group_id TEXT NOT NULL,
+                calls INTEGER NOT NULL, total_tokens INTEGER NOT NULL,
+                missing_usage INTEGER NOT NULL,
+                PRIMARY KEY(user_id, group_id)
+            ) WITHOUT ROWID""",
+            """CREATE INDEX IF NOT EXISTS group_tokens_lookup
+                ON group_tokens(group_id, total_tokens DESC, user_id)""",
             """CREATE TABLE IF NOT EXISTS metadata (
                 id INTEGER PRIMARY KEY CHECK(id=1),
                 state BLOB NOT NULL CHECK(length(state)=2048)
@@ -191,8 +223,9 @@ class Store:
         with self._transaction(write=True):
             for statement in statements:
                 self._conn.execute(statement)
+            started_at = _now()
             state = {
-                "started_at": _now(),
+                "started_at": started_at,
                 "updated_at": None,
                 "write_failures": 0,
                 "last_error": None,
@@ -202,7 +235,13 @@ class Store:
                 "INSERT OR IGNORE INTO metadata(id, state) VALUES(1, ?)",
                 (self._encode_metadata(state),),
             )
-            self._conn.execute("PRAGMA user_version=1")
+            # Existing lifetime totals cannot be assigned to a historical day or
+            # group. Record the new coverage start without inventing that history.
+            state = self._metadata()
+            state.setdefault("daily_started_at", started_at)
+            state.setdefault("group_tokens_started_at", started_at)
+            self._save_metadata(state)
+            self._conn.execute("PRAGMA user_version=2")
         state = self._metadata()
         self._write_failures = state["write_failures"]
         self._last_error = state["last_error"]
@@ -344,7 +383,16 @@ class Store:
         output_tokens: int | None,
         total_tokens: int | None,
         failed: bool = False,
+        *,
+        occurred_at: datetime | None = None,
     ) -> None:
+        """Record a completed call; daily totals follow its Beijing calendar day.
+
+        Only the latest observed day is retained per user. A delayed completion
+        from an older day still enters lifetime/group totals but cannot replace
+        the newer daily bucket. Without a supplied completion timestamp, the time
+        is sampled inside the write transaction to avoid midnight lock ordering.
+        """
         identity = _identity(identity)
         provider, model = _label(provider) or "unknown", _label(model) or "unknown"
         hour = _hour(hour)
@@ -367,7 +415,9 @@ class Store:
             missing,
             int(failed),
         )
+        explicit_day = _beijing_day(occurred_at) if occurred_at is not None else None
         with self._transaction(write=True):
+            day = explicit_day or _beijing_day()
             user = self._user(identity)
             if user["llm_calls"] == _MAX_INT:
                 raise StorageError("llm_calls exceeds the supported integer range")
@@ -404,7 +454,115 @@ class Store:
                    failed_calls=models.failed_calls+excluded.failed_calls""",
                 (user["id"], provider, model, *values),
             )
+            self._conn.execute(
+                """INSERT INTO daily_tokens(user_id, day, llm_calls, input_tokens,
+                   output_tokens, total_tokens, missing_usage, failed_calls)
+                   VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                   day=excluded.day,
+                   llm_calls=CASE WHEN excluded.day=daily_tokens.day
+                       THEN daily_tokens.llm_calls+1 ELSE 1 END,
+                   input_tokens=CASE WHEN excluded.day=daily_tokens.day
+                       THEN daily_tokens.input_tokens+excluded.input_tokens
+                       ELSE excluded.input_tokens END,
+                   output_tokens=CASE WHEN excluded.day=daily_tokens.day
+                       THEN daily_tokens.output_tokens+excluded.output_tokens
+                       ELSE excluded.output_tokens END,
+                   total_tokens=CASE WHEN excluded.day=daily_tokens.day
+                       THEN daily_tokens.total_tokens+excluded.total_tokens
+                       ELSE excluded.total_tokens END,
+                   missing_usage=CASE WHEN excluded.day=daily_tokens.day
+                       THEN daily_tokens.missing_usage+excluded.missing_usage
+                       ELSE excluded.missing_usage END,
+                   failed_calls=CASE WHEN excluded.day=daily_tokens.day
+                       THEN daily_tokens.failed_calls+excluded.failed_calls
+                       ELSE excluded.failed_calls END
+                   WHERE excluded.day>=daily_tokens.day""",
+                (user["id"], day, *values),
+            )
+            if identity.group:
+                self._conn.execute(
+                    """INSERT INTO group_tokens(user_id, group_id, calls,
+                       total_tokens, missing_usage) VALUES (?, ?, 1, ?, ?)
+                       ON CONFLICT(user_id, group_id) DO UPDATE SET
+                       calls=group_tokens.calls+1,
+                       total_tokens=group_tokens.total_tokens+excluded.total_tokens,
+                       missing_usage=group_tokens.missing_usage+excluded.missing_usage""",
+                    (user["id"], identity.group, total_tokens or 0, missing),
+                )
             self._touch()
+
+    def token_summary(self, identity: Identity, *, now: datetime | None = None) -> dict:
+        """Lifetime and current-day tokens; reading never creates or resets rows."""
+        identity = _identity(identity)
+        result = {
+            "user": identity.user,
+            "name": identity.name or identity.user,
+            "today": _beijing_day(now),
+            **dict.fromkeys(_TOKEN_FIELDS, 0),
+            **dict.fromkeys((f"today_{key}" for key in _TOKEN_FIELDS), 0),
+        }
+        with self._transaction(write=False):
+            state = self._metadata()
+            result["started_at"] = state["started_at"]
+            result["daily_started_at"] = state["daily_started_at"]
+            user = self._conn.execute(
+                "SELECT * FROM users WHERE platform=? AND bot=? AND user=?",
+                (identity.platform, identity.bot, identity.user),
+            ).fetchone()
+            if user is None:
+                return result
+            result["name"] = user["name"] or identity.name or identity.user
+            result.update((key, user[key]) for key in _TOKEN_FIELDS)
+            daily = self._conn.execute(
+                "SELECT * FROM daily_tokens WHERE user_id=? AND day=?",
+                (user["id"], result["today"]),
+            ).fetchone()
+            if daily is not None:
+                result.update((f"today_{key}", daily[key]) for key in _TOKEN_FIELDS)
+        return result
+
+    def token_leaderboard(self, identity: Identity, limit: int = 10) -> dict:
+        """Rank known tokens consumed in this group, with shared ranks for ties."""
+        identity = _identity(identity)
+        limit = max(1, min(100, int(limit)))
+        result = {"entries": [], "self": None, "total_users": 0, "missing_usage": 0}
+        parameters = (identity.platform, identity.bot, identity.group)
+        ranking = """SELECT u.user,
+                     CASE WHEN u.name='' THEN u.user ELSE u.name END AS name,
+                     g.total_tokens AS count, g.calls, g.missing_usage,
+                     RANK() OVER (ORDER BY g.total_tokens DESC) AS rank
+                     FROM group_tokens g JOIN users u ON u.id=g.user_id
+                     WHERE u.platform=? AND u.bot=? AND g.group_id=?
+                     AND g.calls>g.missing_usage"""
+        with self._transaction(write=False):
+            result["started_at"] = self._metadata()["group_tokens_started_at"]
+            if not identity.group:
+                return result
+            result["entries"] = [
+                dict(row)
+                for row in self._conn.execute(
+                    f"SELECT * FROM ({ranking}) ORDER BY count DESC, user LIMIT ?",
+                    (*parameters, limit),
+                )
+            ]
+            own = self._conn.execute(
+                f"SELECT * FROM ({ranking}) WHERE user=?", (*parameters, identity.user)
+            ).fetchone()
+            if own is not None:
+                result["self"] = dict(own)
+            rows = self._conn.execute(
+                """SELECT g.calls, g.missing_usage
+                   FROM group_tokens g JOIN users u ON u.id=g.user_id
+                   WHERE u.platform=? AND u.bot=? AND g.group_id=?""",
+                parameters,
+            )
+            # Sum with Python integers: a group total may exceed SQLite INT64 even
+            # while every per-user aggregate remains in the supported range.
+            for row in rows:
+                result["total_users"] += int(row["calls"] > row["missing_usage"])
+                result["missing_usage"] += row["missing_usage"]
+        return result
 
     def personal(
         self,

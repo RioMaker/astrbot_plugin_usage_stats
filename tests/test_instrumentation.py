@@ -690,6 +690,41 @@ class OfficialSourceContractTests(unittest.IsolatedAsyncioTestCase):
         finally:
             tracker.uninstall()
 
+    async def test_real_token_commands_do_not_match_each_others_prefix(self):
+        import re
+
+        namespace = {
+            "inspect": inspect,
+            "re": re,
+            "types": types,
+            "typing": typing,
+            "HandlerFilter": object,
+        }
+        self.source(
+            "astrbot__core__star__filter__command.py",
+            {"GreedyStr", "unwrap_optional", "CommandFilter"},
+            namespace,
+        )
+
+        async def command(self, event):
+            pass
+
+        for registered in ("token", "token排行"):
+            command_filter = namespace["CommandFilter"](
+                registered, handler_md=types.SimpleNamespace(handler=command)
+            )
+            for message in ("token", "token排行", "token排行榜", "token123"):
+                event = types.SimpleNamespace(
+                    is_at_or_wake_command=True,
+                    get_message_str=lambda: message,
+                    set_extra=lambda *args: None,
+                )
+                self.assertEqual(
+                    command_filter.filter(event, {}), message == registered
+                )
+                event.is_at_or_wake_command = False
+                self.assertFalse(command_filter.filter(event, {}))
+
     async def test_real_command_parser_greedy_annotation_requires_no_default(self):
         # Prevent the easy-to-miss Core behavior where a default argument makes
         # a GreedyStr parameter look like a normal string default to the parser.
